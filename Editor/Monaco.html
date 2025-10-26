@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Monaco Editor</title>
+  <style type="text/css">
+    html,
+    body {
+      background-color: #1a1a1a;
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace;
+      color: white;
+    }
+    .scrollbar {
+      padding: 2px !important;
+    }
+    .slider {
+      background-color: #707386 !important;
+      border: none !important;
+      border-radius: 2px !important;
+      margin: 5px !important;
+      opacity: 0.5 !important;
+    }
+    #container {
+      transition: filter 0.3s;
+    }
+    .blurred {
+      filter: blur(5px);
+    }
+    .squiggly-error {
+      border-bottom: 2px wavy red;
+    }
+  </style>
+</head>
+<body>
+  <div id="container" style="width:100%;height:100%;"></div>
+  <script src="vs/loader.js"></script>
+  <script type="text/javascript">
+    require.config({ paths: { 'vs': 'vs' } });
+
+    let ToggleBlur, GetText, SetText, SetTheme, ShowError, SetMiniMap, SetReadonly, SetRenderWhitespace, SetLinks, SetLineHeight, SetFontSize, SetFolding, SetAutoIndent, SetFontFamily, SetFontLigatures, AddIntellisense, AddSnippet, AddRawSnippet, OnDidChangeContent, OnDidChangeCursorPosition, Cut, Copy, Paste, Undo, Redo, Delete, SelectAll, GetProposals;
+    let editor;
+    let Tabs = [];
+    let CreateTab, ChangeTab, DeleteTab;
+    let Proposals = [];
+    let ApiDumpJSON;
+    let completionProviderRegistered = false;
+    let editor2 = null, dualMode = false;
+
+    // --- DRAG & DROP ---
+    window.onload = () => {
+      const container = document.getElementById('container');
+      container.ondragover = e => { e.preventDefault(); };
+      container.ondrop = e => {
+        e.preventDefault();
+        if (e.dataTransfer.files.length) {
+          let file = e.dataTransfer.files[0];
+          let ext = file.name.split('.').pop().toLowerCase();
+          if (!["lua", "luau", "txt"].includes(ext)) {
+            alert("Only .lua, .luau and .txt files are allowed!");
+            return;
+          }
+          let r = new FileReader();
+          r.onload = e2 => { editor.setValue(e2.target.result); };
+          r.readAsText(file);
+        }
+      };
+    };
+    // --- END DRAG & DROP ---
+
+    function fetchApiDump() {
+      return fetch('https://raw.githubusercontent.com/icebearc/monaco-luau/refs/heads/main/server/RobloxLsp/api/API-Dump.json')
+        .then(response => {
+          if (!response.ok) throw new Error('HTTP error! status: ' + response.status);
+          return response.json();
+        })
+        .then(json => {
+          ApiDumpJSON = json;
+          generateProposals();
+          initializeIntellisense();
+        })
+        .catch(e => {
+          console.error("Error fetching API Dump:", e);
+          alert("Failed to load API Dump for Intellisense. Intellisense features will be limited.");
+          generateProposals();
+          initializeIntellisense();
+        });
+    }
+
+    function getAllMembers(className) {
+      let members = [];
+      let visitedClasses = new Set();
+      let currentClass = ApiDumpJSON && ApiDumpJSON.Classes ? ApiDumpJSON.Classes.find(c => c.Name === className) : null;
+      while (currentClass && !visitedClasses.has(currentClass.Name)) {
+        visitedClasses.add(currentClass.Name);
+        if (currentClass.Members) members = members.concat(currentClass.Members);
+        currentClass = ApiDumpJSON.Classes.find(c => c.Name === currentClass.Superclass);
+      }
+      return members;
+    }
+
+    function getMemberKind(member) {
+      switch (member.MemberType) {
+        case "Property":
+          return monaco.languages.CompletionItemKind.Property;
+        case "Function":
+          return monaco.languages.CompletionItemKind.Function;
+        case "Event":
+          return monaco.languages.CompletionItemKind.Event;
+        default:
+          return monaco.languages.CompletionItemKind.Variable;
+      }
+    }
+
+    function generateProposals() {
+      const proposalMap = new Map();
+      if (ApiDumpJSON) {
+        if (ApiDumpJSON.Classes) {
+          ApiDumpJSON.Classes.forEach(cls => {
+            if (!proposalMap.has(cls.Name)) {
+              proposalMap.set(cls.Name, {
+                label: cls.Name,
+                insertText: cls.Name,
+                kind: monaco.languages.CompletionItemKind.Class,
+                detail: cls.Name + " class",
+                documentation: cls.Description || (cls.Name + " class"),
+                tags: cls.Tags ? cls.Tags.map(tag => ({ name: tag })) : undefined
+              });
+            }
+            cls.Members.forEach(member => {
+              const fullName = cls.Name + "." + member.Name;
+              if (!proposalMap.has(fullName)) {
+                proposalMap.set(fullName, {
+                  label: fullName,
+                  insertText: fullName,
+                  kind: getMemberKind(member),
+                  detail: fullName,
+                  documentation: member.Description || fullName
+                });
+              }
+            });
+          });
+        }
+        if (ApiDumpJSON.Enums) {
+          ApiDumpJSON.Enums.forEach(enum_ => {
+            if (!proposalMap.has(enum_.Name)) {
+              proposalMap.set(enum_.Name, {
+                label: enum_.Name,
+                insertText: enum_.Name,
+                kind: monaco.languages.CompletionItemKind.Enum,
+                detail: enum_.Name + " enum",
+                documentation: enum_.Description || (enum_.Name + " enum")
+              });
+            }
+            enum_.Items.forEach(item => {
+              const fullName = enum_.Name + "." + item.Name;
+              if (!proposalMap.has(fullName)) {
+                proposalMap.set(fullName, {
+                  label: fullName,
+                  insertText: fullName,
+                  kind: monaco.languages.CompletionItemKind.EnumMember,
+                  detail: fullName,
+                  documentation: item.Description || fullName
+                });
+              }
+            });
+          });
+        }
+      }
+      Proposals = Array.from(proposalMap.values());
+    }
+
+    function initializeIntellisense() {
+      if (!completionProviderRegistered) {
+        monaco.languages.registerCompletionItemProvider('lua', {
+          provideCompletionItems: function (model, position) {
+            return { suggestions: Proposals };
+          },
+          triggerCharacters: ['.', ':', '"']
+        });
+        completionProviderRegistered = true;
+      }
+    }
+
+    function debounce(func, wait) {
+      let timeout;
+      return function (...args) {
+        clearTimeout(timeout);
+        timeout = setTimeout(() => {
+          func(...args);
+        }, wait);
+      };
+    }
+
+    require(['vs/editor/editor.main'], function () {
+      monaco.editor.defineTheme('custom-dark', {
+        base: 'vs-dark',
+        inherit: true,
+        rules: [
+          { token: 'variable.language.self', foreground: 'a9a0a0' },
+          { token: 'variable.parameter.variadic', foreground: 'a9a0a0' },
+          { token: 'variable.parameter.function', foreground: 'a9a0a0' },
+          { token: 'variable.other.constant', foreground: '93f482' },
+          { token: 'variable.property', foreground: 'f2a04f' },
+          { token: 'variable.object.property', foreground: 'f24f4f' },
+          { token: 'keyword', foreground: '4cc2f7' },
+          { token: 'keyword.local', foreground: 'cd3255', fontStyle: 'bold' },
+          { token: 'keyword.operator', foreground: '4cc2f7' },
+          { token: 'keyword.operator.type.annotation', foreground: '4cc2f7' },
+          { token: 'keyword.operator.typedef.annotation', foreground: '4cc2f7' },
+          { token: 'keyword.control.export', foreground: 'f75e4c', fontStyle: 'bold' },
+          { token: 'operator', foreground: 'c6fc5e' },
+          { token: 'operator.type', foreground: '5e90fc' },
+          { token: 'operator.special', foreground: 'fcfa5e' },
+          { token: 'entity.name.type.alias', foreground: 'ffffff' },
+          { token: 'entity.name.function', foreground: 'f96161' },
+          { token: 'global', foreground: '61afef', fontStyle: 'bold' },
+          { token: 'storage.type', foreground: 'ffffff' },
+          { token: 'comment', foreground: 'abb2bf', fontStyle: 'bold' },
+          { token: 'comment.highlight.title', foreground: '9ea3ac', fontStyle: 'bold' },
+          { token: 'comment.highlight.name', foreground: '9ea3ac', fontStyle: 'bold' },
+          { token: 'comment.delimiter.modifier', foreground: 'abb2bf', fontStyle: 'bold' },
+          { token: 'comment.highlight.modifier', foreground: '94979c', fontStyle: 'bold' },
+          { token: 'comment.highlight.descriptor', foreground: '94979c', fontStyle: 'bold' },
+          { token: 'delimiter.longstring', foreground: 'c4cbd0' },
+          { token: 'delimiter.bracket', foreground: 'c4cbd0' },
+          { token: 'delimiter.array', foreground: 'c4cbd0' },
+          { token: 'delimiter.parenthesis', foreground: 'c4cbd0' },
+          { token: 'delimiter', foreground: 'c4cbd0' },
+          { token: 'string', foreground: '63f499' },
+          { token: 'longstring', foreground: '63f499' },
+          { token: 'string.delimiter', foreground: '63f499' },
+          { token: 'string.escape', foreground: '63f499' },
+          { token: 'punctuation.separator.arguments', foreground: 'ffffff' },
+          { token: 'punctuation.separator.parameter', foreground: 'ffffff' },
+          { token: 'punctuation.separator.table', foreground: 'ffffff' },
+          { token: 'punctuation.definition.block', foreground: 'ffffff' },
+          { token: 'punctuation.definition.parameters', foreground: 'ffffff' },
+          { token: 'punctuation.definition.typeparameters', foreground: 'ffffff' },
+          { token: 'constant.language', foreground: 'a2d4fb' },
+          { token: 'number', foreground: 'e5c07b' },
+          { token: 'constants', foreground: 'a2d4fb' },
+          { token: 'support.function', foreground: '99dbfb' },
+          { token: 'support.function.library', foreground: '99dbfb' },
+          { token: 'support.type', foreground: '99dbfb' }
+        ],
+        colors: {
+          'editor.background': '#141414',
+          'minimap.background': '#141414'
+        }
+      });
+
+      require(['vs/basic-languages/monaco.contribution'], function () {
+        editor = monaco.editor.create(document.getElementById('container'), {
+          value: '',
+          language: 'lua',
+          theme: "custom-dark",
+          folding: true,
+          dragAndDrop: true,
+          links: true,
+          minimap: {
+            enabled: false
+          },
+          showFoldingControls: "always",
+          smoothScrolling: true,
+          stopRenderingLineAfter: 1000,
+          fontSize: 14,
+          cursorBlinking: "smooth",
+          cursorSmoothCaretAnimation: true,
+          foldingHighlight: false,
+          fontLigatures: false,
+          formatOnPaste: true,
+          showDeprecated: true,
+          renderWhitespace: "none",
+          occurrencesHighlight: false,
+          fontFamily: "'Cascadia Code', 'Consolas', 'Courier New', monospace",
+          lineHeight: 22,
+          suggest: {
+            snippetsPreventQuickSuggestions: false,
+            showIcons: true,
+            maxVisibleSuggestions: 8,
+            filterGraceful: false,
+            selectionMode: 'never'
+          },
+          parameterHints: { enabled: false },
+          hover: { enabled: false },
+          lightbulb: { enabled: false },
+          automaticLayout: true
+        });
+        window.editor = editor;
+
+        const model = monaco.editor.createModel("", "lua", monaco.Uri.parse("inmemory://model/0"));
+        model.updateOptions({
+          insertSpaces: false,
+          tabSize: 4,
+          trimAutoWhitespace: true
+        });
+        editor.setModel(model);
+        Tabs.push({
+          tab_id: 0,
+          active: true,
+          model: model,
+          state: editor.saveViewState()
+        });
+        editor.onDidChangeModelContent((event) => {
+          if (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function') {
+            window.chrome.webview.postMessage('TextUpdated');
+          }
+        });
+        fetchApiDump();
+        window.addEventListener('resize', debounce(() => {
+          if (editor) editor.layout();
+        }, 100));
+
+        // ------------------ SPLIT VIEW (Dual Tab) ------------------
+        function layoutDualEditors() {
+          if (dualMode) {
+            if (editor) editor.layout();
+            if (editor2) editor2.layout();
+          } else {
+            if (editor) editor.layout();
+          }
+        }
+        window.CreateDualTab = function(tabIndex) {
+          tabIndex = Number(tabIndex);
+          if (isNaN(tabIndex) || !Tabs[tabIndex] || !Tabs[tabIndex].model) return;
+          let container = document.getElementById('container');
+          let e2div = document.getElementById('container2');
+          if (!dualMode) {
+            container.style.width = "50%";
+            e2div = document.createElement('div');
+            e2div.style.position = 'fixed';
+            e2div.style.left = "50%";
+            e2div.style.top = "0";
+            e2div.style.width = "50%";
+            e2div.style.height = "100%";
+            e2div.id = "container2";
+            e2div.style.background = "#1a1a1a";
+            document.body.appendChild(e2div);
+            const options = {
+              fontSize: editor.getOption?.(monaco.editor.EditorOption.fontSize) || 14,
+              minimap: { enabled: editor.getOption?.(monaco.editor.EditorOption.minimap)?.enabled ?? false },
+              language: "lua",
+              theme: "custom-dark",
+              folding: editor.getOption?.(monaco.editor.EditorOption.folding) ?? true,
+              fontLigatures: editor.getOption?.(monaco.editor.EditorOption.fontLigatures) ?? false,
+              renderWhitespace: editor.getOption?.(monaco.editor.EditorOption.renderWhitespace) ?? "none",
+              lineHeight: editor.getOption?.(monaco.editor.EditorOption.lineHeight) ?? 22,
+              fontFamily: "'Cascadia Code', 'Consolas', 'Courier New', monospace"
+            };
+            editor2 = monaco.editor.create(e2div, {
+              model: Tabs[tabIndex].model,
+              ...options
+            });
+            dualMode = true;
+            window.addEventListener('resize', layoutDualEditors, false);
+            setTimeout(layoutDualEditors, 10);
+          } else {
+            if (editor2 && Tabs[tabIndex] && Tabs[tabIndex].model) {
+              editor2.setModel(Tabs[tabIndex].model);
+            }
+          }
+        };
+        window.ChangeDualTab = function(tabIndex) {
+          tabIndex = Number(tabIndex);
+          if (!dualMode || !editor2) return;
+          if (!isNaN(tabIndex) && Tabs[tabIndex] && Tabs[tabIndex].model) {
+            editor2.setModel(Tabs[tabIndex].model);
+          }
+        };
+        window.DeleteDualTab = function() {
+          let container = document.getElementById('container');
+          let e2div = document.getElementById('container2');
+          if (dualMode && e2div) {
+            if (editor2) { editor2.dispose(); editor2 = null; }
+            e2div.remove();
+            container.style.width = "100%";
+            dualMode = false;
+            window.removeEventListener('resize', layoutDualEditors, false);
+            if (editor) editor.layout();
+          }
+        };
+        // ---------------- END SPLIT VIEW (Dual Tab) ----------------
+
+        // ---- Tab Management ----
+        CreateTab = function () {
+          const currentTabSize = editor.getOptions().tabSize;
+          const newModel = monaco.editor.createModel("", "lua", monaco.Uri.parse(`inmemory://model/${Tabs.length}`));
+          newModel.updateOptions({ tabSize: currentTabSize });
+          const newTab = { tab_id: Tabs.length, dead: false, active: false, model: newModel, state: editor.saveViewState() };
+          Tabs.push(newTab);
+          return Tabs.length - 1;
+        };
+
+        ChangeTab = function (index) {
+          if (index < 0 || index >= Tabs.length || !Tabs[index]) return false;
+          const currentActiveIndex = Tabs.findIndex(tab => tab && tab.active);
+          if (currentActiveIndex !== -1) {
+            Tabs[currentActiveIndex].active = false;
+            Tabs[currentActiveIndex].state = editor.saveViewState();
+          }
+          Tabs[index].active = true;
+          editor.setModel(Tabs[index].model);
+          editor.restoreViewState(Tabs[index].state);
+          editor.focus();
+          return true;
+        };
+
+        DeleteTab = function (index) {
+          if (index < 0 || index >= Tabs.length || !Tabs[index]) return true;
+          if (Tabs[index].active) return false;
+          if (Tabs[index].model) Tabs[index].model.dispose();
+          Tabs[index] = null;
+          return true;
+        };
+
+        SetIndent = function (size) {
+          if (typeof size !== 'number' || size <= 0) return;
+          editor.updateOptions({ tabSize: size });
+          Tabs.forEach(tab => {
+            if (tab && tab.model) tab.model.updateOptions({ tabSize: size });
+          });
+        };
+
+        // ---- Rest (Clipboard, Settings, etc.) ----
+        Cut = function () {
+          if (editor) {
+            editor.focus();
+            const selection = editor.getSelection();
+            const selectedText = editor.getModel().getValueInRange(selection);
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(selectedText).then(() => {
+                editor.executeEdits("cut", [{
+                  range: selection,
+                  text: '',
+                  forceMoveMarkers: true
+                }]);
+              }).catch(err => {
+                console.error("Clipboard error: ", err);
+              });
+            } else {
+              document.execCommand('cut');
+            }
+          }
+        };
+
+        Copy = function () {
+          if (editor) {
+            editor.focus();
+            const selection = editor.getSelection();
+            const selectedText = editor.getModel().getValueInRange(selection);
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(selectedText).catch(err => {
+                console.error("Clipboard error: ", err);
+              });
+            } else {
+              document.execCommand('copy');
+            }
+          }
+        };
+
+        Paste = function () {
+          if (editor) {
+            editor.focus();
+            if (navigator.clipboard && navigator.clipboard.readText) {
+              navigator.clipboard.readText().then(text => {
+                const selection = editor.getSelection();
+                editor.executeEdits("paste", [{
+                  range: selection,
+                  text: text,
+                  forceMoveMarkers: true
+                }]);
+              }).catch(err => {
+                console.error("Clipboard error: ", err);
+              });
+            } else {
+              document.execCommand('paste');
+            }
+          }
+        };
+
+        Undo = function () {
+          if (editor) editor.trigger('editor', 'undo', null);
+        };
+
+        Redo = function () {
+          if (editor) editor.trigger('editor', 'redo', null);
+        };
+
+        Delete = function () {
+          if (editor) {
+            const selection = editor.getSelection();
+            editor.executeEdits("delete", [{
+              range: selection,
+              text: '',
+              forceMoveMarkers: true
+            }]);
+          }
+        };
+
+        SelectAll = function () {
+          if (editor) {
+            editor.focus();
+            const m = editor.getModel();
+            editor.setSelection(new monaco.Range(1, 1, m.getLineCount(), m.getLineMaxColumn(m.getLineCount())));
+          }
+        };
+
+        GetText = function () {
+          return editor ? editor.getValue() : "";
+        };
+
+        SetText = function (x) {
+          if (editor) editor.setValue(x);
+        };
+
+        GetProposals = function () {
+          return Proposals;
+        };
+
+        OnDidChangeContent = (callback => {
+          const listener = editor.onDidChangeModelContent(debounce(() => {
+            callback(editor.getValue());
+          }, 100));
+          return () => {
+            listener.dispose();
+          };
+        });
+
+        OnDidChangeCursorPosition = function (callback) {
+          editor.onDidChangeCursorPosition(e => {
+            callback(e.position);
+          });
+        };
+
+        SetTheme = function (themeName) {
+          if (themeName === 'Dark') {
+            monaco.editor.setTheme('custom-dark');
+          } else {
+            monaco.editor.setTheme(themeName);
+          }
+        };
+
+        SetMiniMap = function (flag) {
+          editor.updateOptions({
+            minimap: { enabled: !!flag }
+          });
+        };
+
+        SetReadonly = function (flag) {
+          editor.updateOptions({
+            readOnly: !!flag
+          });
+        };
+
+        SetRenderWhitespace = function (op) {
+          editor.updateOptions({
+            renderWhitespace: op
+          });
+        };
+
+        SetLinks = function (flag) {
+          editor.updateOptions({
+            links: !!flag
+          });
+        };
+
+        SetLineHeight = function (num) {
+          if (typeof num === 'number' && num > 0) editor.updateOptions({ lineHeight: num });
+        };
+
+        SetFontSize = function (num) {
+          if (typeof num === 'number' && num > 0) editor.updateOptions({ fontSize: num });
+        };
+
+        SetFolding = function (flag) {
+          editor.updateOptions({ folding: !!flag });
+        };
+
+        SetAutoIndent = function (flag) {
+          editor.updateOptions({ autoIndent: !!flag });
+        };
+
+        SetFontFamily = function (name) {
+          editor.updateOptions({ fontFamily: name || "'Cascadia Code', 'Consolas', 'Courier New', monospace" });
+          monaco.editor.remeasureFonts();
+        };
+
+        SetFontLigatures = function (flag) {
+          editor.updateOptions({ fontLigatures: !!flag });
+        };
+
+        let decorationIds = [];
+        ShowError = function (line, column, endline, endcolumn, errMessage) {
+          if (editor) {
+            editor.revealPositionInCenter({ lineNumber: line, column: column });
+            decorationIds = editor.deltaDecorations(decorationIds, [{
+              range: new monaco.Range(line, column, endline, endcolumn),
+              options: { inlineClassName: 'squiggly-error', hoverMessage: { value: errMessage } }
+            }]);
+            setTimeout(() => {
+              decorationIds = editor.deltaDecorations(decorationIds, []);
+            }, 5000);
+          }
+        };
+
+        AddSnippet = function (kindName, snippetName, data) {
+          let kindValue = monaco.languages.CompletionItemKind[kindName] || monaco.languages.CompletionItemKind.Text;
+          let snippet = { insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet, kind: kindValue };
+          for (const key in data) {
+            let value = data[key];
+            if (key === "insertText" && Array.isArray(value)) {
+              value = value.join("\n");
+            }
+            snippet[key] = value;
+          }
+          if (!snippet.label) snippet.label = snippetName;
+          if (!snippet.insertText) snippet.insertText = snippetName;
+          Proposals.push(snippet);
+        };
+
+        AddRawSnippet = function (data) {
+          if (data && typeof data === 'object') {
+            Proposals.push(data);
+          }
+        };
+
+        AddIntellisense = function (n, k, d, desc, i) {
+          let kindValue = monaco.languages.CompletionItemKind[k] || monaco.languages.CompletionItemKind.Text;
+          let m = {
+            label: n,
+            kind: kindValue,
+            documentation: { value: "```lua\n" + d + "\n```\n\n" + desc },
+            insertText: i
+          };
+          Proposals.push(m);
+        };
+
+        ToggleBlur = (function () {
+          let isBlurredActive = false, isMouseOver = false, container = null;
+          function onMouseOver() { isMouseOver = true; container.classList.remove('blurred'); }
+          function onMouseLeave() { isMouseOver = false; container.classList.add('blurred'); }
+          function onVisibilityChange() { if (!document.hidden && isBlurredActive && !isMouseOver) { container.classList.add('blurred'); } }
+          return function (enable) {
+            if (!container) {
+              container = document.getElementById('container');
+              if (!container) return;
+            }
+            if (enable && !isBlurredActive) {
+              container.classList.add('blurred');
+              container.addEventListener('mouseover', onMouseOver);
+              container.addEventListener('mouseleave', onMouseLeave);
+              document.addEventListener('visibilitychange', onVisibilityChange);
+              isBlurredActive = true;
+            } else if (!enable && isBlurredActive) {
+              container.classList.remove('blurred');
+              container.removeEventListener('mouseover', onMouseOver);
+              container.removeEventListener('mouseleave', onMouseLeave);
+              document.removeEventListener('visibilitychange', onVisibilityChange);
+              isBlurredActive = false;
+            }
+          };
+        })();
+      });
+    });
+  </script>
+</body>
+</html>
